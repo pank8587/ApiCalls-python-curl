@@ -1,0 +1,299 @@
+import boto3 
+import csv , json
+import logging
+import re
+
+
+def ip_list(logger,region_list):
+    public_ip=dict()
+    public_dns=dict()
+    private_ip=dict()
+    private_dns=dict()
+    for region in region_list:
+        ec2_client= boto3.client('ec2',region_name=region)
+        res_eni=ec2_client.describe_network_interfaces()
+        logger.info("eni response::" + str(res_eni)) 
+        for i in res_eni.get('NetworkInterfaces'):
+            for j in i.get('PrivateIpAddresses'):
+                try:
+                    publicIp=j.get('Association').get('PublicIp')
+                    publicDns= j.get('Association').get('PublicDnsName')
+                except:
+                    publicIp=None
+                    publicDns=None
+                privateIp=j.get('PrivateIpAddress')
+                privateDns=j.get('PrivateDnsName')
+                public_ip[publicIp]=publicIp
+                public_dns[publicDns]=publicDns
+                private_ip[privateIp]=privateIp
+                private_dns[privateDns]=privateDns
+                del publicIp,publicDns,privateIp,privateDns
+
+        res_eip= ec2_client.describe_addresses()
+        for i in res_eip.get('Addresses'):
+            publicIp=i.get('PublicIp')
+            privateIp=i.get('PrivateIpAddress')
+            public_ip[publicIp]=publicIp
+            private_ip[privateIp]=privateIp
+            del publicIp,privateIp
+
+        logger.info("public_ip response::" + str(public_ip))
+        logger.info("public_dns response::" + str(public_dns))
+        logger.info("private_ip response::" + str(private_ip))
+        logger.info("private_dns response::" + str(private_dns))
+        return public_ip,public_dns,private_ip,private_dns
+
+def cf_list(logger):
+    cf = boto3.client('cloudfront')
+    # List distributions
+    cf_dns=dict()
+    #print("\nCloudFront Distributions:\n")
+    distributions=cf.list_distributions()
+    if distributions['DistributionList']['Quantity'] > 0:
+        for distribution in distributions['DistributionList']['Items']:
+            cf_dns[distribution['DomainName']]=distribution['Id']
+    else:    
+        print("Error - No CloudFront Distributions Detected.") 
+    logger.info("Cloudfront response:: " + str(cf_dns))
+    return cf_dns
+
+def lb_list(logger,region_list):
+    elb_list=dict()
+    for region in region_list:
+        client = boto3.client('elbv2',region_name=region) 
+        paginator = client.get_paginator('describe_load_balancers') 
+        response_iterator = paginator.paginate() 
+        count=0 
+        for i in response_iterator: 
+            for elb in i.get('LoadBalancers'): 
+                elb_list[elb.get('DNSName')]=elb.get('DNSName')
+                count += 1 
+        logger.info("alb/nlb count:: " + str(count)) 
+        elb_client = boto3.client('elb',region_name=region) 
+        paginator = elb_client.get_paginator('describe_load_balancers') 
+        response= paginator.paginate() 
+        count=0 
+        for i in response: 
+            for elb in i.get('LoadBalancerDescriptions'): 
+                #print(elb.get('LoadBalancerName')) 
+                elb_list[elb.get('DNSName')]=elb.get('DNSName')
+                count += 1 
+        logger.info("elb count:: " + str(count))
+        logger.info("elb_list:: " + str(elb_list)) 
+        return elb_list
+
+def list_acm(logger,region_list):
+    acm_list=dict()
+    count=0
+    for region in region_list:
+        acm_client = boto3.client('acm',region_name=region)
+        paginator = acm_client.get_paginator('list_certificates')
+        paginate= paginator.paginate()
+        for page in paginate:
+            for i in page.get('CertificateSummaryList'):
+                response=acm_client.describe_certificate(CertificateArn=i.get('CertificateArn'))
+                # print(response)
+                for res in response.get('Certificate').get('DomainValidationOptions'):
+                    count += 1
+                    if res.get('ValidationMethod') =='DNS':  
+                        acm_dns=res.get('ResourceRecord').get('Value').rstrip(".")
+                        acm_list[acm_dns]=res.get('ResourceRecord').get('Name').rstrip(".")
+                    # print(acm_list)
+                # print(count)
+    logger.info("acm list:: " + str(acm_list))
+    return acm_list
+
+def list_rds(logger,region_list):
+    rds_list=dict()
+    for region in region_list:
+        rds_client = boto3.client('rds',region_name=region)
+        response=rds_client.describe_db_instances()
+        for i in response.get('DBInstances'):
+            rds_list[i.get('Endpoint').get('Address')]=i.get('DBInstanceIdentifier')
+        logger.info("rds list:: "+ str(rds_list))
+    return rds_list
+
+def list_cached(logger,region_list):
+    ec_list=dict()
+    for region in region_list:
+        ec_client = boto3.client('elasticache',region_name=region)
+        res=ec_client.describe_cache_clusters(ShowCacheNodeInfo=True)
+        for  i in res.get('CacheClusters'): 
+            try:
+                ec_list[i.get('CacheNodes')[0].get('Endpoint').get('Address')]=i.get('CacheNodes')[0].get('Endpoint').get('Address')
+            except AttributeError as err:
+                logger.error(err)
+    logger.info("elasticache list :: " + str(ec_list))
+    return ec_list
+
+def getHostedZones(logger):
+    route53 = boto3.client('route53')
+    data = route53.list_hosted_zones()
+    list_=dict()
+    for i in data.get('HostedZones'): 
+        list_["".join(i.get('Id').split("/")[-1])]=i.get('Name') 
+    logger.info("hosted zone:: " + str(list_))
+    return list_
+#print(cf_list().keys())
+
+#def Route53_record_sets(r53_client,HostedZoneId,elb_list,cf_dns,public_ip,public_dns,private_ip,private_dns):
+def Route53_record_sets(logger,HostedZonelist):
+    r53_client = boto3.client('route53')
+    paginator = r53_client.get_paginator('list_resource_record_sets') 
+    count=0
+    record_list=list()
+    record_dns=list()
+    HostedZone=dict()
+    for HostedZoneId in HostedZonelist:
+        response= paginator.paginate(HostedZoneId=HostedZoneId) 
+        for records in response: 
+            for record in records.get('ResourceRecordSets'): 
+                temp = dict()
+                #print(record.get('Name'))
+                temp['Name']=record.get('Name')
+                record_dns.append(record.get('Name'))
+                #print(record.get('Type'))
+                temp['Type']= record.get('Type')
+                temp['HostedZone']=HostedZonelist[HostedZoneId]
+                HostedZone[HostedZonelist[HostedZoneId]]=HostedZonelist[HostedZoneId]
+                if record.get('AliasTarget'):
+                    #print(record.get('AliasTarget')['DNSName'])
+                    temp['Target']=record.get('AliasTarget')['DNSName']     
+                if record.get('ResourceRecords'):
+                    temp_item=modify_str(logger,record.get('ResourceRecords')[0].get('Value'))
+                    temp['Target']=temp_item.rstrip('.')
+                    # print(temp_item)
+                    #print(Check)
+                logger.info("records..:: " + str(temp))
+                record_list.append(temp)
+                # print(record) 
+                # print() 
+                count += 1
+        logger.info("hostedzone:: " + str(HostedZoneId)) 
+        logger.info("count:: " + str(count))
+        logger.info("records dns:: "+ str(record_dns))
+        
+        # print(record_dns)
+
+    return record_list,record_dns,HostedZone
+
+def modify_str(logger,item):
+    item=item.replace(" ","")
+    if 'cloudfront' in item:
+        logger.info("cloudfront modify str:: " + str(item.rstrip('.')))
+        return item.rstrip('.')
+    elif 'dualstack' in item:
+        temp_res=".".join(item.split('.')[1:-1]).strip()
+        logger.info("loadbalancer modify str:: " + str(temp_res))
+        return temp_res
+    else:
+        logger.info("modify item str::"+ str(item))
+        return item
+
+def check_dns(item,HostedZone):
+    regex= '''^(25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)\.( 
+            25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)\.( 
+            25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)\.( 
+            25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)$'''
+    for i in HostedZone:
+        if i in item:
+            i_len=len(i) 
+            item_len=len(item) 
+            index=item.find(i,0,item_len) 
+            if index+i_len == item_len or index+i_len == item_len-1 or index+i_len == item_len+1: 
+                return True
+    if(re.search(regex, item)):  
+        return True
+    elif ".cloudfront." in item:
+        return True
+    elif ".elb." in item:
+        return True 
+    elif ".acm-validations." in item:
+        return True
+    elif ".rds." in item:
+        return True
+    elif "cache." in item:
+        return True
+    else:  
+        return False
+
+
+def check(logger,item,record_dns,elb_list,cf_dns,public_ip,public_dns,private_ip,private_dns,ec_list,rds_list,acm_list,HostedZone):
+    
+    if check_dns(item,HostedZone):
+        if item in record_dns:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in elb_list:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in cf_dns:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in public_ip:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in public_dns:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in private_ip:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in private_dns:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in ec_list:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in rds_list:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        elif item in acm_list:
+            logger.info("Inuse::" + str(item))
+            return "InUse"
+        else:
+            logger.info("UNUSED::" + str(item))
+            return "UNUSED"
+    else:
+        logger.info("UnChecked::" + str(item))
+        return "UnChecked"
+    
+def main(logger,region_list,csv_filename):
+    elb_list=lb_list(logger,region_list)
+    cf_dns=cf_list(logger)
+    public_ip,public_dns,private_ip,private_dns=ip_list(logger,region_list)
+    HostedZonelist=getHostedZones(logger)
+    ec_list=list_cached(logger,region_list)
+    rds_list=list_rds(logger,region_list)
+    acm_list=list_acm(logger,region_list)
+    Route53_record,record_dns,HostedZone=Route53_record_sets(logger,HostedZonelist)
+    
+    record_list=list()
+    for i in Route53_record:
+        temp=dict()
+        temp['Name']=i.get('Name')
+        temp['Type']=i.get('Type')
+        temp['Target']=i.get('Target')
+        temp['HostedZone']=i.get('HostedZone')
+        try:
+            temp_item=modify_str(logger,i.get('Target'))
+            Check=check(logger,temp_item,record_dns,elb_list,cf_dns,public_ip,public_dns,private_ip,private_dns,ec_list,rds_list,acm_list,HostedZone)
+        except:
+            Check="Unchecked"
+        temp['Check']= Check
+        record_list.append(temp) 
+        csv_filename 
+    logger.info("record_list:: " + str(record_list))
+    with open(csv_filename, 'w', newline='') as file: 
+        writer = csv.writer(file) 
+        writer.writerow(["HostedZone","Name","Type","Target","Check"]) 
+        for i in record_list:
+            writer.writerow([i.get("HostedZone"),i.get("Name"),i.get("Type"),i.get("Target"),i.get("Check")]) 
+            
+if __name__ == "__main__":
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    region_list=["ap-south-1","ap-southeast-1"]
+    csv_filename="records.csv"
+    main(logger,region_list,csv_filename)
